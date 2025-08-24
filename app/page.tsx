@@ -1,90 +1,153 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-"use client";
 
-import styles from "./page.module.css";
-import { useEffect, useMemo, useState } from "react";
+// app/page.tsx
+"use client";
 
 export const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "https://guardrail-wrapper.onrender.com";
 
-type RedactionType = "email" | "phone" | "ssn" | "credit_card" | "name" | "other";
+import { useEffect, useMemo, useState } from "react";
 
-interface Incident {
+type RedactionType =
+  | "email"
+  | "phone"
+  | "ssn"
+  | "credit_card"
+  | "name"
+  | "other";
+
+interface Metrics {
+  total_requests: number;
+  flagged_count?: number; // backend returns flagged_count
+  flagged_outputs?: number; // keep for compatibility
+  flag_rate: number; // 0..1
+}
+
+// What the /logs endpoint returns (from your FastAPI code)
+interface LogRow {
   id: number;
-  time: string;
-  provider: string;
+  timestamp: string; // ISO string like "2025-08-24T18:32:16Z" (sqlite: datetime(...))
+  provider: string;  // "mock" | "openai"
+  flagged: boolean;
+  redactions: { type: string; value: string }[];
+}
+
+interface ScanRequest { prompt: string; }
+
+interface ScanResponse {
+  raw_output: string;
+  redacted_output: string;
+  flagged: boolean;
+  // some versions also include incidents/logs—ignore if missing
+}
+
+interface ChatReply {
+  answer: string;
   flagged: boolean;
   redactions: RedactionType[];
 }
-interface Metrics { total_requests: number; flagged_count: number; flag_rate: number; }
-interface ScanRequest { prompt: string; }
-interface ScanResponse { raw_output: string; redacted_output: string; flagged: boolean; incidents: Incident[]; }
-interface LogEntry { id: number; time: string; level: "info" | "warn" | "error"; message: string; }
-interface ChatRequest { user: string; message: string; }
-interface ChatReply { answer: string; flagged: boolean; redactions: RedactionType[]; }
 
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
   return (await res.json()) as T;
 }
-function formatRate(n: number) { return `${((n || 0) * 100).toFixed(1)}%`; }
+
+function formatRate(rate: number): string {
+  if (Number.isNaN(rate)) return "0%";
+  return `${(rate * 100).toFixed(1)}%`;
+}
 
 export default function Page() {
-  const [prompt, setPrompt] = useState("");
+  // Prompt tester
+  const [prompt, setPrompt] = useState<string>("");
   const [scan, setScan] = useState<ScanResponse | null>(null);
-  const [loadingScan, setLoadingScan] = useState(false);
+  const [loadingScan, setLoadingScan] = useState<boolean>(false);
 
+  // Dashboard data
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [loadingDash, setLoadingDash] = useState(true);
+  const [logs, setLogs] = useState<LogRow[]>([]);
+  const [loadingDash, setLoadingDash] = useState<boolean>(true);
+
   const apiHealthy = useMemo(() => Boolean(API_URL), []);
 
+  // Single loader we can call on mount and after a scan
+  const loadDashboard = async () => {
+    if (!API_URL) return;
+    setLoadingDash(true);
+    try {
+      const [m, l] = await Promise.all([
+        fetchJSON<Metrics>(`${API_URL}/metrics`),
+        // use /logs instead of /incidents to match backend:
+        fetchJSON<LogRow[]>(`${API_URL}/logs?limit=10`),
+      ]);
+      setMetrics(m);
+      setLogs(l);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingDash(false);
+    }
+  };
+
   useEffect(() => {
-    (async () => {
-      if (!API_URL) return;
-      setLoadingDash(true);
-      try {
-        const [m, recent, l] = await Promise.all([
-          fetchJSON<Metrics>(`${API_URL}/metrics`),
-          fetchJSON<Incident[]>(`${API_URL}/incidents?limit=10`),
-          fetchJSON<LogEntry[]>(`${API_URL}/logs?limit=10`),
-        ]);
-        setMetrics(m); setIncidents(recent); setLogs(l);
-      } catch (e) { console.error(e); } finally { setLoadingDash(false); }
-    })();
+    loadDashboard();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const onSubmitPrompt = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!prompt.trim() || !API_URL) return;
-    setLoadingScan(true); setScan(null);
+    setLoadingScan(true);
+    setScan(null);
     try {
+      // If your backend endpoint is /chat change here,
+      // otherwise keep /scan if you created that:
       const body: ScanRequest = { prompt };
-      const result = await fetchJSON<ScanResponse>(`${API_URL}/scan`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+      const result = await fetchJSON<ScanResponse>(`${API_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       });
       setScan(result);
+      // 🔁 refresh dashboard after a successful scan
+      await loadDashboard();
     } catch (err) {
       console.error(err);
-      setScan({ raw_output: "—", redacted_output: "Request failed. See console for details.", flagged: false, incidents: [] });
-    } finally { setLoadingScan(false); }
+      setScan({
+        raw_output: "—",
+        redacted_output: "Request failed. See console for details.",
+        flagged: false,
+      });
+    } finally {
+      setLoadingScan(false);
+    }
   };
 
+  // optional chat demo kept for completeness
   const sendChat = async (message: string): Promise<ChatReply | null> => {
     if (!API_URL) return null;
-    const body: ChatRequest = { user: "tester", message };
     return fetchJSON<ChatReply>(`${API_URL}/chat`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user: "tester", message }),
     });
   };
 
+  // derive a compatible “flagged outputs” number for the KPI
+  const flaggedOutputs =
+    metrics?.flagged_outputs ??
+    metrics?.flagged_count ??
+    0;
+
   return (
-    <div className={styles.wrapper}>
+    <main className="mx-auto max-w-6xl p-6 space-y-8">
       <header className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Showcase</h1>
-        <p className={styles.lede}>
+        <h1 className="text-2xl font-semibold">Showcase</h1>
+        <p className="text-sm text-neutral-600">
           Middleware that intercepts LLM outputs, redacts PII, logs incidents, and exposes KPIs.
         </p>
         {!apiHealthy && (
@@ -94,25 +157,31 @@ export default function Page() {
         )}
       </header>
 
-      {/* KPIs */}
-      <section className={styles.kpis}>
-        <div className={styles.card}>
-          <div className={styles.kpiLabel}>Total Requests</div>
-          <div className={styles.kpiValue}>{loadingDash ? "—" : metrics?.total_requests ?? 0}</div>
+      {/* KPI cards */}
+      <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="rounded-xl border p-4 bg-white">
+          <div className="text-sm text-neutral-600">Total Requests</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : metrics?.total_requests ?? 0}
+          </div>
         </div>
-        <div className={styles.card}>
-          <div className={styles.kpiLabel}>Flagged Outputs</div>
-          <div className={styles.kpiValue}>{loadingDash ? "—" : metrics?.flagged_count ?? 0}</div>
+        <div className="rounded-xl border p-4 bg-white">
+          <div className="text-sm text-neutral-600">Flagged Outputs</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : flaggedOutputs}
+          </div>
         </div>
-        <div className={styles.card}>
-          <div className={styles.kpiLabel}>Flag Rate</div>
-          <div className={styles.kpiValue}>{loadingDash ? "—" : formatRate(metrics?.flag_rate ?? 0)}</div>
+        <div className="rounded-xl border p-4 bg-white">
+          <div className="text-sm text-neutral-600">Flag Rate</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : formatRate(metrics?.flag_rate ?? 0)}
+          </div>
         </div>
       </section>
 
       {/* Prompt Tester */}
-      <section className={styles.card}>
-        <h2 className="text-lg font-semibold mb-3">Prompt Tester</h2>
+      <section className="rounded-2xl border p-5 bg-white space-y-4">
+        <h2 className="text-lg font-semibold">Prompt Tester</h2>
         <form onSubmit={onSubmitPrompt} className="space-y-3">
           <textarea
             value={prompt}
@@ -128,19 +197,23 @@ export default function Page() {
             >
               {loadingScan ? "Scanning…" : "Scan with Guardrails"}
             </button>
-            <button type="button" onClick={() => setPrompt("")} className="rounded-lg border px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setPrompt("")}
+              className="rounded-lg border px-3 py-2"
+            >
               Reset
             </button>
           </div>
         </form>
 
         {scan && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-            <div className="rounded-lg border p-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="rounded-lg border p-3 bg-white">
               <div className="text-sm font-medium mb-2">Raw Output</div>
               <pre className="whitespace-pre-wrap text-sm">{scan.raw_output}</pre>
             </div>
-            <div className="rounded-lg border p-3">
+            <div className="rounded-lg border p-3 bg-white">
               <div className="text-sm font-medium mb-2">
                 Redacted Output {scan.flagged ? "• Flagged" : ""}
               </div>
@@ -150,35 +223,37 @@ export default function Page() {
         )}
       </section>
 
-      {/* Recent Incidents */}
-      <section className={styles.card}>
-        <h2 className="text-lg font-semibold mb-3">Recent Incidents</h2>
+      {/* Recent Incidents (read from /logs) */}
+      <section className="rounded-2xl border p-5 bg-white space-y-3">
+        <h2 className="text-lg font-semibold">Recent Incidents</h2>
         <div className="overflow-x-auto">
-          <table className={styles.table}>
-            <thead>
+          <table className="w-full text-sm">
+            <thead className="text-left text-neutral-600">
               <tr>
-                <th className={styles.th}>ID</th>
-                <th className={styles.th}>Time</th>
-                <th className={styles.th}>Provider</th>
-                <th className={styles.th}>Flagged</th>
-                <th className={styles.th}>Redactions</th>
+                <th className="py-2 pr-3">ID</th>
+                <th className="py-2 pr-3">Time</th>
+                <th className="py-2 pr-3">Provider</th>
+                <th className="py-2 pr-3">Flagged</th>
+                <th className="py-2 pr-3">Redactions</th>
               </tr>
             </thead>
             <tbody>
-              {incidents.map((it) => (
-                <tr key={it.id}>
-                  <td className={styles.td}>{it.id}</td>
-                  <td className={styles.td}>{new Date(it.time).toLocaleString()}</td>
-                  <td className={styles.td}>{it.provider}</td>
-                  <td className={styles.td}>
-                    <span className={styles.badge}>{it.flagged ? "Yes" : "No"}</span>
+              {logs.map((row) => (
+                <tr key={row.id} className="border-t">
+                  <td className="py-2 pr-3">{row.id}</td>
+                  <td className="py-2 pr-3">{new Date(row.timestamp).toLocaleString()}</td>
+                  <td className="py-2 pr-3">{row.provider}</td>
+                  <td className="py-2 pr-3">{row.flagged ? "Yes" : "No"}</td>
+                  <td className="py-2 pr-3">
+                    {row.redactions?.length
+                      ? row.redactions.map((r) => r.type).join(", ")
+                      : "—"}
                   </td>
-                  <td className={styles.td}>{it.redactions.join(", ") || "—"}</td>
                 </tr>
               ))}
-              {!incidents.length && (
+              {!logs.length && (
                 <tr>
-                  <td className={styles.td} colSpan={5}>
+                  <td className="py-3 text-neutral-500" colSpan={5}>
                     {loadingDash ? "Loading…" : "No incidents yet."}
                   </td>
                 </tr>
@@ -188,19 +263,24 @@ export default function Page() {
         </div>
       </section>
 
-      {/* Quick Chat */}
-      <section className={styles.card}>
-        <h2 className="text-lg font-semibold mb-3">Quick Chat</h2>
+      {/* Quick Chat (optional) */}
+      <section className="rounded-2xl border p-5 bg-white space-y-3">
+        <h2 className="text-lg font-semibold">Quick Chat</h2>
         <ChatBox onSend={sendChat} />
       </section>
-    </div>
+    </main>
   );
 }
 
-function ChatBox({ onSend }: { onSend: (message: string) => Promise<ChatReply | null> }) {
-  const [msg, setMsg] = useState("");
+/** Minimal chat box */
+function ChatBox({
+  onSend,
+}: {
+  onSend: (message: string) => Promise<ChatReply | null>;
+}) {
+  const [msg, setMsg] = useState<string>("");
   const [response, setResponse] = useState<ChatReply | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<boolean>(false);
 
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -232,12 +312,14 @@ function ChatBox({ onSend }: { onSend: (message: string) => Promise<ChatReply | 
         </button>
       </form>
       {response && (
-        <div className="rounded-lg border p-3 text-sm">
+        <div className="rounded-lg border p-3 text-sm bg-white">
           <div className="font-medium mb-1">Answer</div>
           <div className="whitespace-pre-wrap">{response.answer}</div>
           <div className="text-xs text-neutral-600 mt-2">
             {response.flagged ? "Flagged" : "Not flagged"} •{" "}
-            {response.redactions.length ? response.redactions.join(", ") : "no redactions"}
+            {response.redactions.length
+              ? response.redactions.join(", ")
+              : "no redactions"}
           </div>
         </div>
       )}
