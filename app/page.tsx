@@ -1,181 +1,317 @@
-'use client';
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { useEffect, useState } from 'react';
+// app/page.tsx
+"use client";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || '';
+import { useEffect, useMemo, useState } from "react";
 
-export default function Home() {
-  const [prompt, setPrompt] = useState('');
-  const [scanning, setScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [raw, setRaw] = useState('');
-  const [redacted, setRedacted] = useState('');
-  const [metrics, setMetrics] = useState<{ total_requests: number; flagged_count: number; flag_rate: number } | null>(null);
-  const [logs, setLogs] = useState<any[]>([]);
+type RedactionType = "email" | "phone" | "ssn" | "credit_card" | "name" | "other";
 
-  // helper: fetch with timeout
-  async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, ms = 10000) {
-    const ctrl = new AbortController();
-    const id = setTimeout(() => ctrl.abort(), ms);
-    try {
-      const res = await fetch(input, { ...init, signal: ctrl.signal });
-      return res;
-    } finally {
-      clearTimeout(id);
-    }
+interface Incident {
+  id: number;
+  time: string;            // ISO string from API
+  provider: string;        // "mock" | "openai" | etc.
+  flagged: boolean;
+  redactions: RedactionType[]; // e.g. ["email","phone"]
+}
+
+interface Metrics {
+  total_requests: number;
+  flagged_outputs: number;
+  flag_rate: number; // 0..1 from API
+}
+
+interface ScanRequest {
+  prompt: string;
+}
+
+interface ScanResponse {
+  raw_output: string;
+  redacted_output: string;
+  flagged: boolean;
+  incidents: Incident[];
+}
+
+interface LogEntry {
+  id: number;
+  time: string;  // ISO string
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
+interface ChatRequest {
+  user: string;
+  message: string;
+}
+
+interface ChatReply {
+  answer: string;
+  flagged: boolean;
+  redactions: RedactionType[];
+}
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? ""; // set on Vercel
+
+async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
+  return (await res.json()) as T;
+}
 
-  // On mount: verify env + ping + load metrics/logs
+function formatRate(rate: number): string {
+  if (Number.isNaN(rate)) return "0%";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+export default function Page() {
+  // Prompt tester
+  const [prompt, setPrompt] = useState<string>("");
+  const [scan, setScan] = useState<ScanResponse | null>(null);
+  const [loadingScan, setLoadingScan] = useState<boolean>(false);
+
+  // Metrics + incidents + logs
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [loadingDash, setLoadingDash] = useState<boolean>(true);
+  const apiHealthy = useMemo(() => Boolean(API_URL), []);
+
   useEffect(() => {
-    console.log('API_BASE =', API_BASE);
-    if (!API_BASE) {
-      setError('Frontend missing NEXT_PUBLIC_API_BASE. Put it in guardrail-admin/.env.local and restart `npm run dev`.');
-      return;
-    }
-
-    (async () => {
+    // Pull dashboard data
+    const run = async () => {
+      if (!API_URL) return;
+      setLoadingDash(true);
       try {
-        // ping health
-        const ping = await fetchWithTimeout(`${API_BASE}/`, {}, 4000);
-        if (!ping.ok) throw new Error(`Health check failed: ${ping.status}`);
-
-        // load metrics
-        const m = await fetchWithTimeout(`${API_BASE}/metrics`, {}, 6000);
-        if (m.ok) setMetrics(await m.json());
-
-        // load logs
-        const lg = await fetchWithTimeout(`${API_BASE}/logs?limit=25`, {}, 6000);
-        if (lg.ok) setLogs(await lg.json());
-      } catch (e: any) {
-        setError(`Startup error: ${e.message || e}`);
+        const [m, recent, l] = await Promise.all([
+          fetchJSON<Metrics>(`${API_URL}/metrics`),
+          fetchJSON<Incident[]>(`${API_URL}/incidents?limit=10`),
+          fetchJSON<LogEntry[]>(`${API_URL}/logs?limit=10`)
+        ]);
+        setMetrics(m);
+        setIncidents(recent);
+        setLogs(l);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingDash(false);
       }
-    })();
+    };
+    run();
   }, []);
 
-  async function onScan() {
-    setError(null);
-    setScanning(true);
-    setRaw('');
-    setRedacted('');
-
+  const onSubmitPrompt = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!prompt.trim() || !API_URL) return;
+    setLoadingScan(true);
+    setScan(null);
     try {
-      const res = await fetchWithTimeout(`${API_BASE}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      }, 15000);
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`POST /chat failed: ${res.status} ${text}`);
-      }
-
-      const data = await res.json();
-      setRaw(data.raw_output || '');
-      setRedacted(data.output_message || '');
-
-      // refresh KPIs + logs after a successful scan
-      const [m, lg] = await Promise.all([
-        fetchWithTimeout(`${API_BASE}/metrics`, {}, 6000),
-        fetchWithTimeout(`${API_BASE}/logs?limit=25`, {}, 6000),
-      ]);
-
-      if (m.ok) setMetrics(await m.json());
-      if (lg.ok) setLogs(await lg.json());
-    } catch (e: any) {
-      setError(e.message || String(e));
+      const body: ScanRequest = { prompt };
+      const result = await fetchJSON<ScanResponse>(`${API_URL}/scan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      setScan(result);
+    } catch (err) {
+      console.error(err);
+      setScan({
+        raw_output: "—",
+        redacted_output: "Request failed. See console for details.",
+        flagged: false,
+        incidents: []
+      });
     } finally {
-      setScanning(false);
+      setLoadingScan(false);
     }
-  }
+  };
 
-  function reset() {
-    setPrompt('');
-    setRaw('');
-    setRedacted('');
-    setError(null);
-  }
+  const sendChat = async (message: string): Promise<ChatReply | null> => {
+    if (!API_URL) return null;
+    const body: ChatRequest = { user: "tester", message };
+    return fetchJSON<ChatReply>(`${API_URL}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  };
 
   return (
-    <main style={{ maxWidth: 980, margin: '40px auto', padding: 16 }}>
-      <h1>GuardRail Wrapper — Showcase</h1>
-      <p>Middleware that intercepts LLM outputs, redacts PII, logs incidents, and exposes KPIs.</p>
+    <main className="mx-auto max-w-5xl p-6 space-y-8">
+      <header className="space-y-1">
+        <h1 className="text-2xl font-semibold">GuardRail Wrapper — Showcase</h1>
+        <p className="text-sm text-neutral-600">
+          Middleware that intercepts LLM outputs, redacts PII, logs incidents, and exposes KPIs.
+        </p>
+        {!apiHealthy && (
+          <p className="text-sm text-amber-600">
+            Set <code>NEXT_PUBLIC_API_URL</code> in Vercel env to your Render URL.
+          </p>
+        )}
+      </header>
 
-      <div style={{ display: 'flex', gap: 16, marginTop: 16 }}>
-        <Kpi title="Total Requests" value={metrics?.total_requests ?? 0} />
-        <Kpi title="Flagged Outputs" value={metrics?.flagged_count ?? 0} />
-        <Kpi title="Flag Rate" value={`${((metrics?.flag_rate ?? 0) * 100).toFixed(1)}%`} />
-      </div>
-
-      <section style={{ marginTop: 24, padding: 16, border: '1px solid #eee', borderRadius: 8 }}>
-        <h3>Prompt Tester</h3>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Paste text with emails/phones/SSNs…"
-          rows={6}
-          style={{ width: '100%', fontFamily: 'monospace', padding: 8 }}
-        />
-
-        <div style={{ display: 'flex', gap: 12, marginTop: 12 }}>
-          <button onClick={onScan} disabled={scanning} style={{ padding: '8px 14px' }}>
-            {scanning ? 'Scanning…' : 'Scan with Guardrails'}
-          </button>
-          <button onClick={reset} style={{ padding: '8px 14px' }}>Reset</button>
+      {/* KPI cards */}
+      <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="rounded-xl border p-4">
+          <div className="text-sm text-neutral-600">Total Requests</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : metrics?.total_requests ?? 0}
+          </div>
         </div>
+        <div className="rounded-xl border p-4">
+          <div className="text-sm text-neutral-600">Flagged Outputs</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : metrics?.flagged_outputs ?? 0}
+          </div>
+        </div>
+        <div className="rounded-xl border p-4">
+          <div className="text-sm text-neutral-600">Flag Rate</div>
+          <div className="text-2xl font-semibold">
+            {loadingDash ? "—" : formatRate(metrics?.flag_rate ?? 0)}
+          </div>
+        </div>
+      </section>
 
-        {error && <p style={{ color: 'crimson', marginTop: 12 }}>{error}</p>}
+      {/* Prompt Tester */}
+      <section className="rounded-2xl border p-5 space-y-4">
+        <h2 className="text-lg font-semibold">Prompt Tester</h2>
+        <form onSubmit={onSubmitPrompt} className="space-y-3">
+          <textarea
+            value={prompt}
+            onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setPrompt(e.target.value)}
+            placeholder="Try: Send the file to j.smith(at)company(dot)com"
+            className="w-full min-h-[96px] rounded-lg border p-3 outline-none"
+          />
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              disabled={loadingScan || !prompt.trim()}
+              className="rounded-lg bg-black text-white px-4 py-2 disabled:opacity-50"
+            >
+              {loadingScan ? "Scanning…" : "Scan with Guardrails"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setPrompt("")}
+              className="rounded-lg border px-3 py-2"
+            >
+              Reset
+            </button>
+          </div>
+        </form>
 
-        {(raw || redacted) && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
-            <div>
-              <h4>Raw Output</h4>
-              <pre style={{ background: '#fafafa', padding: 8 }}>{raw || '—'}</pre>
+        {scan && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="rounded-lg border p-3">
+              <div className="text-sm font-medium mb-2">Raw Output</div>
+              <pre className="whitespace-pre-wrap text-sm">{scan.raw_output}</pre>
             </div>
-            <div>
-              <h4>Redacted Output</h4>
-              <pre style={{ background: '#fafafa', padding: 8 }}>{redacted || '—'}</pre>
+            <div className="rounded-lg border p-3">
+              <div className="text-sm font-medium mb-2">
+                Redacted Output {scan.flagged ? "• Flagged" : ""}
+              </div>
+              <pre className="whitespace-pre-wrap text-sm">{scan.redacted_output}</pre>
             </div>
           </div>
         )}
       </section>
 
-      <section style={{ marginTop: 24, padding: 16, border: '1px solid #eee', borderRadius: 8 }}>
-        <h3>Recent Incidents</h3>
-        {logs.length === 0 ? (
-          <p>No incidents yet. Run a few scans.</p>
-        ) : (
-          <table width="100%" cellPadding={6} style={{ fontSize: 14 }}>
-            <thead>
-              <tr><th align="left">ID</th><th align="left">Time</th><th align="left">Provider</th><th align="left">Flagged</th><th align="left">Redactions</th></tr>
+      {/* Recent Incidents */}
+      <section className="rounded-2xl border p-5 space-y-3">
+        <h2 className="text-lg font-semibold">Recent Incidents</h2>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-left text-neutral-600">
+              <tr>
+                <th className="py-2 pr-3">ID</th>
+                <th className="py-2 pr-3">Time</th>
+                <th className="py-2 pr-3">Provider</th>
+                <th className="py-2 pr-3">Flagged</th>
+                <th className="py-2 pr-3">Redactions</th>
+              </tr>
             </thead>
             <tbody>
-              {logs.map((r) => (
-                <tr key={r.id}>
-                  <td>{r.id}</td>
-                  <td>{r.timestamp}</td>
-                  <td>{r.provider}</td>
-                  <td>{r.flagged ? 'Yes' : 'No'}</td>
-                  <td>{Array.isArray(r.redactions) && r.redactions.length
-                    ? r.redactions.map((x: any) => x.type).join(', ')
-                    : '—'}</td>
+              {incidents.map((it) => (
+                <tr key={it.id} className="border-t">
+                  <td className="py-2 pr-3">{it.id}</td>
+                  <td className="py-2 pr-3">{new Date(it.time).toLocaleString()}</td>
+                  <td className="py-2 pr-3">{it.provider}</td>
+                  <td className="py-2 pr-3">{it.flagged ? "Yes" : "No"}</td>
+                  <td className="py-2 pr-3">{it.redactions.join(", ") || "—"}</td>
                 </tr>
               ))}
+              {!incidents.length && (
+                <tr>
+                  <td className="py-3 text-neutral-500" colSpan={5}>
+                    {loadingDash ? "Loading…" : "No incidents yet."}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
-        )}
+        </div>
       </section>
 
-      <p style={{ marginTop: 24, color: '#777' }}>API: {API_BASE || '(missing NEXT_PUBLIC_API_BASE)'}</p>
+      {/* Quick Chat (optional) */}
+      <section className="rounded-2xl border p-5 space-y-3">
+        <h2 className="text-lg font-semibold">Quick Chat</h2>
+        <ChatBox onSend={sendChat} />
+      </section>
     </main>
   );
 }
 
-function Kpi({ title, value }: { title: string; value: any }) {
+/** Minimal chat box with strict types */
+function ChatBox({
+  onSend
+}: {
+  onSend: (message: string) => Promise<ChatReply | null>;
+}) {
+  const [msg, setMsg] = useState<string>("");
+  const [response, setResponse] = useState<ChatReply | null>(null);
+  const [busy, setBusy] = useState<boolean>(false);
+
+  const submit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!msg.trim()) return;
+    setBusy(true);
+    try {
+      const r = await onSend(msg);
+      setResponse(r ?? null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <div style={{ flex: 1, border: '1px solid #eee', borderRadius: 8, padding: 16 }}>
-      <div style={{ color: '#666', fontSize: 12 }}>{title}</div>
-      <div style={{ fontSize: 28, fontWeight: 600 }}>{value}</div>
+    <div className="space-y-3">
+      <form onSubmit={submit} className="flex gap-2">
+        <input
+          value={msg}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setMsg(e.target.value)}
+          className="flex-1 rounded-lg border px-3 py-2"
+          placeholder="Say hi to the wrapper…"
+        />
+        <button
+          type="submit"
+          disabled={busy || !msg.trim()}
+          className="rounded-lg bg-black text-white px-4 py-2 disabled:opacity-50"
+        >
+          {busy ? "Sending…" : "Send"}
+        </button>
+      </form>
+      {response && (
+        <div className="rounded-lg border p-3 text-sm">
+          <div className="font-medium mb-1">Answer</div>
+          <div className="whitespace-pre-wrap">{response.answer}</div>
+          <div className="text-xs text-neutral-600 mt-2">
+            {response.flagged ? "Flagged" : "Not flagged"} •{" "}
+            {response.redactions.length ? response.redactions.join(", ") : "no redactions"}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
