@@ -107,7 +107,7 @@ export default function Page() {
       // If your backend endpoint is /chat change here,
       // otherwise keep /scan if you created that:
       const body: ScanRequest = { prompt };
-      const result = await fetchJSON<ScanResponse>(`${API_URL}/scan`, {
+      const result = await fetchJSON<ScanResponse>(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
