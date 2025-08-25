@@ -161,9 +161,12 @@ export default function Page() {
     <main className="mx-auto max-w-6xl p-6 space-y-8">
       {/* top note */}
       <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Showcase</h1>
+        <h1 className="text-2xl font-semibold">Guardrail Governance Layer Showcase</h1>
         <p className="text-sm text-neutral-600">
           Middleware that intercepts LLM outputs, redacts PII, logs incidents, and exposes KPIs.
+        </p>
+        <p className="text-sm text-neutral-600">
+          Hosted on Render.com with a free plan (may take ~30-60s to wake if idle).{" "}
         </p>
         {!apiConfigured && (
           <p className="text-sm text-amber-600">
