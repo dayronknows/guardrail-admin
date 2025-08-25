@@ -1,44 +1,34 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-
 // app/page.tsx
 "use client";
 
-export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "https://guardrail-wrapper.onrender.com";
-
 import { useEffect, useMemo, useState } from "react";
 
-type RedactionType =
-  | "email"
-  | "phone"
-  | "ssn"
-  | "credit_card"
-  | "name"
-  | "other";
+/** ---- CONFIG ---- */
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
+
+/** ---- TYPES (must match API) ---- */
+type RedactionType = "email" | "phone" | "ssn" | "credit_card" | "name" | "other";
+
+interface Incident {
+  id: number;
+  time: string;                 // your API returns `time`
+  provider: string;             // "mock" | "openai"
+  flagged: boolean;
+  redactions: RedactionType[];  // e.g. ["email"]
+}
 
 interface Metrics {
   total_requests: number;
-  flagged_count?: number; // backend returns flagged_count
-  flagged_outputs?: number; // keep for compatibility
-  flag_rate: number; // 0..1
+  flagged_outputs: number;
+  flag_rate: number;            // 0..1
 }
-
-// What the /logs endpoint returns (from your FastAPI code)
-interface LogRow {
-  id: number;
-  timestamp: string; // ISO string like "2025-08-24T18:32:16Z" (sqlite: datetime(...))
-  provider: string;  // "mock" | "openai"
-  flagged: boolean;
-  redactions: { type: string; value: string }[];
-}
-
-interface ScanRequest { prompt: string; }
 
 interface ScanResponse {
   raw_output: string;
   redacted_output: string;
   flagged: boolean;
-  // some versions also include incidents/logs—ignore if missing
+  incidents: Incident[];
 }
 
 interface ChatReply {
@@ -47,115 +37,151 @@ interface ChatReply {
   redactions: RedactionType[];
 }
 
+/** ---- SMALL HELPERS ---- */
+const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+    throw new Error(`${res.status} ${res.statusText}`);
   }
-  return (await res.json()) as T;
+  return res.json() as Promise<T>;
 }
 
-function formatRate(rate: number): string {
-  if (Number.isNaN(rate)) return "0%";
-  return `${(rate * 100).toFixed(1)}%`;
-}
-
+/** ---- PAGE ---- */
 export default function Page() {
-  // Prompt tester
+  // Prompt tester state
   const [prompt, setPrompt] = useState<string>("");
   const [scan, setScan] = useState<ScanResponse | null>(null);
   const [loadingScan, setLoadingScan] = useState<boolean>(false);
 
-  // Dashboard data
+  // Dashboard state
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [logs, setLogs] = useState<LogRow[]>([]);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
   const [loadingDash, setLoadingDash] = useState<boolean>(true);
 
-  const apiHealthy = useMemo(() => Boolean(API_URL), []);
+  // Wake server state
+  const [waking, setWaking] = useState<boolean>(false);
+  const apiConfigured = useMemo(() => Boolean(API_URL), []);
 
-  // Single loader we can call on mount and after a scan
-  const loadDashboard = async () => {
+  /** Load dashboard data */
+  async function loadDashboard() {
     if (!API_URL) return;
     setLoadingDash(true);
     try {
-      const [m, l] = await Promise.all([
+      const [m, recents] = await Promise.all([
         fetchJSON<Metrics>(`${API_URL}/metrics`),
-        // use /logs instead of /incidents to match backend:
-        fetchJSON<LogRow[]>(`${API_URL}/logs?limit=10`),
+        fetchJSON<Incident[]>(`${API_URL}/incidents?limit=10`),
       ]);
       setMetrics(m);
-      setLogs(l);
+      setIncidents(recents);
     } catch (err) {
+      // keep quiet but show zeros
       console.error(err);
     } finally {
       setLoadingDash(false);
     }
-  };
+  }
 
   useEffect(() => {
     loadDashboard();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Wake/initialize server on Render (health ping loop with soft timeout) */
+  async function wakeServer() {
+    if (!API_URL || waking) return;
+    setWaking(true);
+    const deadline = Date.now() + 75_000; // ~75s patience
+
+    try {
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`${API_URL}/`, { cache: "no-store" });
+          if (res.ok) break;
+        } catch {
+          // ignore transient errors while waking
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    } finally {
+      setWaking(false);
+      // refresh KPIs once awake
+      loadDashboard();
+    }
+  }
+
+  /** Submit prompt to /scan */
   const onSubmitPrompt = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!prompt.trim() || !API_URL) return;
+
     setLoadingScan(true);
     setScan(null);
+
     try {
-      // If your backend endpoint is /chat change here,
-      // otherwise keep /scan if you created that:
-      const body: ScanRequest = { prompt };
-      const result = await fetchJSON<ScanResponse>(`${API_URL}/chat`, {
+      const body = { prompt };
+      const result: ScanResponse = await fetch(`${API_URL}/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      });
+      }).then((r) => r.json());
+
+      // Ensure Raw/Redacted fill in:
+      // { raw_output, redacted_output, flagged, incidents }
       setScan(result);
-      // 🔁 refresh dashboard after a successful scan
-      await loadDashboard();
+
+      // refresh KPIs after a successful scan
+      loadDashboard();
     } catch (err) {
       console.error(err);
       setScan({
         raw_output: "—",
         redacted_output: "Request failed. See console for details.",
         flagged: false,
+        incidents: [],
       });
     } finally {
       setLoadingScan(false);
     }
   };
 
-  // optional chat demo kept for completeness
-  const sendChat = async (message: string): Promise<ChatReply | null> => {
+  /** Minimal chat (POST /chat with {message}) */
+  async function sendChat(message: string): Promise<ChatReply | null> {
     if (!API_URL) return null;
+    const body = { message };
     return fetchJSON<ChatReply>(`${API_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user: "tester", message }),
+      body: JSON.stringify(body),
     });
-  };
-
-  // derive a compatible “flagged outputs” number for the KPI
-  const flaggedOutputs =
-    metrics?.flagged_outputs ??
-    metrics?.flagged_count ??
-    0;
+  }
 
   return (
     <main className="mx-auto max-w-6xl p-6 space-y-8">
+      {/* top note */}
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold">Showcase</h1>
         <p className="text-sm text-neutral-600">
           Middleware that intercepts LLM outputs, redacts PII, logs incidents, and exposes KPIs.
         </p>
-        {!apiHealthy && (
+        {!apiConfigured && (
           <p className="text-sm text-amber-600">
-            Set <code>NEXT_PUBLIC_API_URL</code> in Vercel env to your Render URL.
+            Set <code>NEXT_PUBLIC_API_URL</code> in your env to the Render API URL.
           </p>
         )}
       </header>
+
+      {/* Wake / Initialize */}
+      <div className="mb-2">
+        <button
+          onClick={wakeServer}
+          disabled={waking || !apiConfigured}
+          className="rounded-lg bg-amber-600 text-white px-4 py-2 disabled:opacity-50"
+        >
+          {waking ? "Warming up…" : "Initialize / Wake Server"}
+        </button>
+      </div>
 
       {/* KPI cards */}
       <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -168,19 +194,19 @@ export default function Page() {
         <div className="rounded-xl border p-4 bg-white">
           <div className="text-sm text-neutral-600">Flagged Outputs</div>
           <div className="text-2xl font-semibold">
-            {loadingDash ? "—" : flaggedOutputs}
+            {loadingDash ? "—" : metrics?.flagged_outputs ?? 0}
           </div>
         </div>
         <div className="rounded-xl border p-4 bg-white">
           <div className="text-sm text-neutral-600">Flag Rate</div>
           <div className="text-2xl font-semibold">
-            {loadingDash ? "—" : formatRate(metrics?.flag_rate ?? 0)}
+            {loadingDash ? "—" : pct(metrics?.flag_rate ?? 0)}
           </div>
         </div>
       </section>
 
       {/* Prompt Tester */}
-      <section className="rounded-2xl border p-5 bg-white space-y-4">
+      <section className="rounded-2xl border p-5 space-y-4 bg-white">
         <h2 className="text-lg font-semibold">Prompt Tester</h2>
         <form onSubmit={onSubmitPrompt} className="space-y-3">
           <textarea
@@ -192,7 +218,7 @@ export default function Page() {
           <div className="flex items-center gap-3">
             <button
               type="submit"
-              disabled={loadingScan || !prompt.trim()}
+              disabled={loadingScan || !prompt.trim() || !apiConfigured}
               className="rounded-lg bg-black text-white px-4 py-2 disabled:opacity-50"
             >
               {loadingScan ? "Scanning…" : "Scan with Guardrails"}
@@ -223,8 +249,8 @@ export default function Page() {
         )}
       </section>
 
-      {/* Recent Incidents (read from /logs) */}
-      <section className="rounded-2xl border p-5 bg-white space-y-3">
+      {/* Recent Incidents */}
+      <section className="rounded-2xl border p-5 space-y-3 bg-white">
         <h2 className="text-lg font-semibold">Recent Incidents</h2>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -238,20 +264,16 @@ export default function Page() {
               </tr>
             </thead>
             <tbody>
-              {logs.map((row) => (
-                <tr key={row.id} className="border-t">
-                  <td className="py-2 pr-3">{row.id}</td>
-                  <td className="py-2 pr-3">{new Date(row.timestamp).toLocaleString()}</td>
-                  <td className="py-2 pr-3">{row.provider}</td>
-                  <td className="py-2 pr-3">{row.flagged ? "Yes" : "No"}</td>
-                  <td className="py-2 pr-3">
-                    {row.redactions?.length
-                      ? row.redactions.map((r) => r.type).join(", ")
-                      : "—"}
-                  </td>
+              {incidents.map((it) => (
+                <tr key={it.id} className="border-t">
+                  <td className="py-2 pr-3">{it.id}</td>
+                  <td className="py-2 pr-3">{new Date(it.time).toLocaleString()}</td>
+                  <td className="py-2 pr-3">{it.provider}</td>
+                  <td className="py-2 pr-3">{it.flagged ? "Yes" : "No"}</td>
+                  <td className="py-2 pr-3">{it.redactions.join(", ") || "—"}</td>
                 </tr>
               ))}
-              {!logs.length && (
+              {!incidents.length && (
                 <tr>
                   <td className="py-3 text-neutral-500" colSpan={5}>
                     {loadingDash ? "Loading…" : "No incidents yet."}
@@ -263,32 +285,34 @@ export default function Page() {
         </div>
       </section>
 
-      {/* Quick Chat (optional) */}
-      <section className="rounded-2xl border p-5 bg-white space-y-3">
+      {/* Quick Chat */}
+      <section className="rounded-2xl border p-5 space-y-3 bg-white">
         <h2 className="text-lg font-semibold">Quick Chat</h2>
-        <ChatBox onSend={sendChat} />
+        <ChatBox onSend={sendChat} disabled={!apiConfigured} />
       </section>
     </main>
   );
 }
 
-/** Minimal chat box */
+/** ---- Small Chat Box ---- */
 function ChatBox({
   onSend,
+  disabled = false,
 }: {
   onSend: (message: string) => Promise<ChatReply | null>;
+  disabled?: boolean;
 }) {
   const [msg, setMsg] = useState<string>("");
-  const [response, setResponse] = useState<ChatReply | null>(null);
+  const [resp, setResp] = useState<ChatReply | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
 
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!msg.trim()) return;
+    if (!msg.trim() || disabled) return;
     setBusy(true);
     try {
       const r = await onSend(msg);
-      setResponse(r ?? null);
+      setResp(r ?? null);
     } finally {
       setBusy(false);
     }
@@ -302,24 +326,23 @@ function ChatBox({
           onChange={(e) => setMsg(e.target.value)}
           className="flex-1 rounded-lg border px-3 py-2"
           placeholder="Say hi to the wrapper…"
+          disabled={disabled}
         />
         <button
           type="submit"
-          disabled={busy || !msg.trim()}
+          disabled={busy || !msg.trim() || disabled}
           className="rounded-lg bg-black text-white px-4 py-2 disabled:opacity-50"
         >
           {busy ? "Sending…" : "Send"}
         </button>
       </form>
-      {response && (
+      {resp && (
         <div className="rounded-lg border p-3 text-sm bg-white">
           <div className="font-medium mb-1">Answer</div>
-          <div className="whitespace-pre-wrap">{response.answer}</div>
+          <div className="whitespace-pre-wrap">{resp.answer}</div>
           <div className="text-xs text-neutral-600 mt-2">
-            {response.flagged ? "Flagged" : "Not flagged"} •{" "}
-            {response.redactions.length
-              ? response.redactions.join(", ")
-              : "no redactions"}
+            {resp.flagged ? "Flagged" : "Not flagged"} •{" "}
+            {resp.redactions.length ? resp.redactions.join(", ") : "no redactions"}
           </div>
         </div>
       )}
